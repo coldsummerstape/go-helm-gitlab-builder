@@ -2,7 +2,7 @@
 
 ## Logic Overview
 
-The logic consists of the following stages:
+The logic consists of the following stages
 
 1. **Preparation (.pre)**  
 2. **Building binary files (build)**  
