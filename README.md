@@ -1,5 +1,3 @@
----
-
 # **Go Helm GitLab Builder** 🏗️🐳🚀  
 
 **Automated CI/CD pipeline** for **Go applications** with **Docker & Helm** using **GitLab CI/CD**  
