@@ -1,0 +1,200 @@
+include:
+- component: $CI_SERVER_FQDN/guided-explorations/ci-components/kaniko/kaniko@2.3.10
+
+variables:
+  GO_IMAGE: "golang:1.23-alpine3.20"
+  GOPROXY: "direct"
+  GIT_DEPTH: "1"
+  GIT_SUBMODULE_STRATEGY: "recursive"
+  HELM_CLI_IMAGE: "alpine/helm:3.10.2"
+  HELM_CHART_DIR: "./charts"
+  HELM_CHANNEL: "stable"
+
+stages:
+- .pre
+- build
+- docker-build
+- helm-push
+
+# **Stage .pre: Generates a unique semantic version**
+.pre_get_unique_semversion:
+  stage: .pre
+  script:
+  - echo "Retrieving a unique semantic version"
+  tags:
+  - "saas-linux-medium-amd64" # Using GitLab's shared runner
+  rules:
+  - when: always # This stage always runs
+
+# **Stage build-go: Compiles Go binaries for different architectures**
+build-go:
+  image: $GO_IMAGE
+  stage: build
+  parallel:
+    matrix:
+    - GO_TARGET_OS: "linux"
+      GO_TARGET_ARCH: "amd64"
+      RUNNER_TAG: "saas-linux-medium-amd64" # GitLab SaaS runner for amd64
+    - GO_TARGET_OS: "linux"
+      GO_TARGET_ARCH: "arm64"
+      RUNNER_TAG: "saas-linux-large-arm64" # GitLab SaaS runner for arm64
+  script:
+  - apk add --no-cache openssh-client git
+  - mkdir -p ~/.ssh
+  - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+  - eval $(ssh-agent -s)
+  - chmod 600 "$SSH_PRIVATE_KEY"
+  - ssh-add "$SSH_PRIVATE_KEY"
+  - git config --global url."git@$CI_SERVER_HOST:".insteadOf "https://$CI_SERVER_HOST/"
+  - git config --global user.email "$GITLAB_USER_EMAIL"
+  - git config --global user.name "$GITLAB_USER_LOGIN"
+  - go mod tidy
+  - go mod vendor
+  - mkdir -p ./.out/$GO_TARGET_OS-$GO_TARGET_ARCH
+  - |
+    find . -name main.go | while read main; do
+      dir=$(dirname $main)
+      output_name=$(basename $dir)
+      echo "Building binary: $output_name"
+      GOOS=$GO_TARGET_OS GOARCH=$GO_TARGET_ARCH go build -o ./.out/$GO_TARGET_OS-$GO_TARGET_ARCH/$output_name $main
+    done
+  - ls -la ./.out/$GO_TARGET_OS-$GO_TARGET_ARCH/
+  tags:
+  - $RUNNER_TAG
+  artifacts:
+    paths:
+    - ./.out/$GO_TARGET_OS-$GO_TARGET_ARCH/ # Store compiled binaries
+    - ./src/migrations/ # Include migrations if available
+    - ./assets # Include additional assets if available
+    expire_in: 1 week # Keep artifacts for one week
+
+# **Stage docker-build: Build and push Docker images**
+docker-build:
+  stage: docker-build
+  dependencies:
+  - build-go
+  parallel:
+    matrix:
+    - GO_TARGET_OS: "linux"
+      GO_TARGET_ARCH: "amd64"
+      RUNNER_TAG: "saas-linux-medium-amd64"
+    - GO_TARGET_OS: "linux"
+      GO_TARGET_ARCH: "arm64"
+      RUNNER_TAG: "saas-linux-large-arm64"
+  script:
+  - WORKSPACE_DIR="/workspace/$GO_TARGET_OS-$GO_TARGET_ARCH"
+  - mkdir -p $WORKSPACE_DIR/src
+  - cp -R ./.out/$GO_TARGET_OS-$GO_TARGET_ARCH/* $WORKSPACE_DIR/
+  - |
+    if [ -d "./src/migrations" ]; then
+      cp -R ./src/migrations $WORKSPACE_DIR/migrations
+    else
+      echo "Directory ./src/migrations does not exist, skipping copy."
+    fi
+  - |
+    if [ -d "./assets" ]; then
+      cp -R ./assets $WORKSPACE_DIR/assets
+    else
+      echo "Directory ./assets does not exist, skipping copy."
+    fi
+  - echo "Contents of $WORKSPACE_DIR:"
+  - ls -R $WORKSPACE_DIR
+
+  - |
+    # Determine Docker image tag
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      TAG="${CI_COMMIT_TAG}-${GO_TARGET_ARCH}"
+    else
+      TAG="${CI_COMMIT_REF_SLUG}-${GO_TARGET_ARCH}"
+    fi
+    echo "Using tag: $TAG"
+
+  - |
+    # Generate a Dockerfile for each binary file
+    for binary_file in "$WORKSPACE_DIR"/*; do
+      if [ -x "$binary_file" ] && [ ! -d "$binary_file" ]; then
+        binary_name=$(basename "$binary_file")
+        echo "Generating Dockerfile for binary $binary_name"
+
+        # Generate base Dockerfile
+        echo "# Base image
+        FROM golang:1.23-alpine3.20
+
+        # Install required tools for debugging and building Go applications
+        RUN apk update && apk add --no-cache \\
+            git \\
+            bash \\
+            curl \\
+            vim  \\
+            mysql-client \\
+            iproute2 && \\
+            go install github.com/grpc-ecosystem/grpc-health-probe@latest && \\
+            echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories \\
+            apk add grpcurl --update-cache
+
+        ENV PATH="/app:/usr/local/bin:/busybox:/bin"
+        
+        # Copy the binary file
+        COPY ./${binary_name} /app/${binary_name}" > "$WORKSPACE_DIR/Dockerfile.$binary_name"
+
+        # Add migrations if it's a migrator
+        if [ "$binary_name" = "migrator" ]; then
+          echo "
+        # Copy migrations
+        COPY ./migrations /app/migrations" >> "$WORKSPACE_DIR/Dockerfile.$binary_name"
+        fi
+
+        # Add assets if the folder exists
+        if [ -d "$WORKSPACE_DIR/assets" ]; then
+          echo "
+        # Copy assets
+        COPY ./assets /app/assets" >> "$WORKSPACE_DIR/Dockerfile.$binary_name"
+        fi
+
+        # Finalize Dockerfile
+        echo "
+        # Set the default command
+        CMD [\"/app/${binary_name}\"]" >> "$WORKSPACE_DIR/Dockerfile.$binary_name"
+
+        echo "Example Dockerfile for $binary_name:"
+        cat "$WORKSPACE_DIR/Dockerfile.$binary_name"
+      fi
+    done
+
+  - |
+    # Build and push Docker images
+    for dockerfile in "$WORKSPACE_DIR"/Dockerfile.*; do
+      binary_name=$(basename "$dockerfile" | cut -d. -f2)
+      echo "Building image for $binary_name with tag $TAG"
+      /kaniko/executor --dockerfile "$dockerfile" --context "$WORKSPACE_DIR" --destination "${CI_REGISTRY_IMAGE}/${binary_name}:${TAG}"
+    done
+
+  image:
+    name: gcr.io/kaniko-project/executor:v1.14.0-debug
+    entrypoint: [ "" ]
+  tags:
+  - $RUNNER_TAG
+
+# **Stage helm-push: Push the Helm chart**
+helm-push:
+  image:
+    name: $HELM_CLI_IMAGE
+    entrypoint: [ "" ]
+  stage: helm-push
+  script:
+  - apk add --no-cache yq
+  - echo "Starting Helm push job..."
+  - helm package $HELM_CHART_DIR
+  - export CHART_PACKAGE=$(ls | grep ".tgz$")
+  - echo "Uploading $CHART_PACKAGE to Helm registry"
+  - |
+    curl --fail-with-body --request POST \
+      --user gitlab-ci-token:$CI_JOB_TOKEN \
+      --form "chart=@${CHART_PACKAGE}" \
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/${HELM_CHANNEL}/charts"
+  rules:
+  - if: '$CI_COMMIT_TAG' # Run only if a commit tag exists
+  variables:
+    HELM_CHANNEL: "stable"
+  tags:
+  - "saas-linux-medium-amd64"
