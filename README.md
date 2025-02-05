@@ -120,4 +120,4 @@ The final stage is updating and publishing the Helm chart.
 
 As a result, once everything is ready, any Kubernetes cluster configured to use this Helm registry can pull the chart and deploy the application as pods with the correct images (amd64 or arm64).
 
-This provides a **fully automated pipeline**: from code changes in the repository to a deployable Helm chart with up-to-date Docker images.
+This provides a **fully automated pipeline**: from code changes in the repository to a deployable Helm chart with up-to-date Docker images.# go-helm-gitlab-builder
