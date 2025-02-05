@@ -1,5 +1,3 @@
-Вот перевод README на английский:
-
 ---
 
 ## Logic Overview
